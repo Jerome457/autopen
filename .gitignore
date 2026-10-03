@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+
+data/credentials.txt
+data/*.pcap
+data/*.pcapng
+data/*.db
+
+reports/*.html
+
+.env
