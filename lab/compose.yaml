@@ -1,0 +1,63 @@
+name: autopen-lab
+
+services:
+  target-a:
+    build:
+      context: ./target-a
+    image: autopen-lab/target-a-ssh:1
+    container_name: autopen-target-a
+    hostname: target-a
+    init: true
+    secrets:
+      - ssh_password
+    networks:
+      lab_net:
+        ipv4_address: 172.28.50.10
+    security_opt:
+      - no-new-privileges:true
+
+  target-b:
+    build:
+      context: ./target-b
+    image: autopen-lab/target-b-http:1
+    container_name: autopen-target-b
+    hostname: target-b
+    init: true
+    networks:
+      lab_net:
+        ipv4_address: 172.28.50.20
+    security_opt:
+      - no-new-privileges:true
+
+  target-c:
+    build:
+      context: ./target-c
+    image: autopen-lab/target-c-ftp:1
+    container_name: autopen-target-c
+    hostname: target-c
+    init: true
+    secrets:
+      - ftp_password
+    networks:
+      lab_net:
+        ipv4_address: 172.28.50.30
+    security_opt:
+      - no-new-privileges:true
+
+secrets:
+  ssh_password:
+    file: ./secrets/ssh_password.txt
+  ftp_password:
+    file: ./secrets/ftp_password.txt
+
+networks:
+  lab_net:
+    name: autopen-lab
+    driver: bridge
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.name: aplab0
+    ipam:
+      config:
+        - subnet: 172.28.50.0/24
+          gateway: 172.28.50.1

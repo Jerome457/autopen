@@ -2,6 +2,7 @@
 __pycache__/
 
 data/credentials.txt
+data/lab_credentials.txt
 data/*.pcap
 data/*.pcapng
 data/*.db
@@ -13,3 +14,5 @@ reports/*.html
 reports/assessments/
 
 .env
+
+lab/secrets/
