@@ -7,7 +7,9 @@ from pathlib import Path
 
 from modules.database import (
     create_assessment,
+    create_assessment_host,
     finish_assessment,
+    finish_assessment_host,
     insert_credential_result,
     insert_packets,
     insert_services,
@@ -159,6 +161,40 @@ class ReportTests(unittest.TestCase):
             after = connection.execute("SELECT COUNT(*) FROM assessments").fetchone()[0]
         self.assertEqual(before, 2)
         self.assertEqual(after, before)
+
+    def test_failed_skipped_and_timed_out_are_not_reported_as_no_match(self) -> None:
+        assessment_id = create_assessment("127.0.0.1", database_path=self.database_path)
+        host_id = create_assessment_host(
+            assessment_id, "127.0.0.1", "lo", self.database_path
+        )
+        for outcome in ("skipped", "failed", "timed_out"):
+            insert_credential_result(
+                assessment_id,
+                {"service": "ssh", "port": 22, "username": "lab", "outcome": outcome},
+                self.database_path,
+                host_id,
+            )
+        finish_assessment_host(
+            host_id,
+            "partial",
+            "password: CandidateSecret failed",
+            self.database_path,
+        )
+        finish_assessment(
+            assessment_id, database_path=self.database_path, status="partial"
+        )
+
+        generate_report(self.database_path, assessment_id, self.report_path)
+        document = self.report_path.read_text(encoding="utf-8")
+
+        self.assertIn("Skipped", document)
+        self.assertIn("Failed", document)
+        self.assertIn("Timed out", document)
+        self.assertNotIn("No credential matched", document)
+        self.assertNotIn("CandidateSecret", document)
+        self.assertIn("Assessment status", document)
+        self.assertIn("Host status", document)
+        self.assertIn("partial", document)
 
 
 if __name__ == "__main__":

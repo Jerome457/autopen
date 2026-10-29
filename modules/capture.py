@@ -72,7 +72,17 @@ def start_capture(
     except OSError as exc:
         raise CaptureError(f"Unable to start TShark: {exc}") from exc
 
-    time.sleep(startup_delay)
+    try:
+        time.sleep(startup_delay)
+    except BaseException:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+        raise
     if process.poll() is not None:
         detail = _process_error(process)
         raise CaptureError(

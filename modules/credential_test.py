@@ -18,6 +18,10 @@ MAX_TEST_PASSWORDS = 20
 class CredentialTestError(RuntimeError):
     """Raised when the controlled credential test cannot be completed."""
 
+    def __init__(self, message: str, outcome: str = "failed") -> None:
+        super().__init__(message)
+        self.outcome = outcome
+
 
 class CredentialResult(TypedDict):
     """Structured outcome of one controlled SSH credential test."""
@@ -25,8 +29,8 @@ class CredentialResult(TypedDict):
     service: str
     port: int
     username: str
-    credential_found: bool
-    matched_password: str | None
+    outcome: str
+    credential_found: bool | None
 
 
 _MATCH_PATTERN = re.compile(
@@ -79,8 +83,8 @@ def parse_hydra_output(output: str, port: int, username: str) -> CredentialResul
                 "service": "ssh",
                 "port": port,
                 "username": username,
+                "outcome": "matched",
                 "credential_found": True,
-                "matched_password": match.group("password"),
             }
 
     if _NO_MATCH_PATTERN.search(output):
@@ -88,8 +92,8 @@ def parse_hydra_output(output: str, port: int, username: str) -> CredentialResul
             "service": "ssh",
             "port": port,
             "username": username,
+            "outcome": "no_match",
             "credential_found": False,
-            "matched_password": None,
         }
 
     raise CredentialTestError("Hydra returned unexpected output that could not be parsed.")
@@ -143,7 +147,9 @@ def run_ssh_credential_test(
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
-        raise CredentialTestError(f"Hydra timed out after {timeout} seconds.") from exc
+        raise CredentialTestError(
+            f"Hydra timed out after {timeout} seconds.", outcome="timed_out"
+        ) from exc
     except OSError as exc:
         raise CredentialTestError(f"Unable to start Hydra: {exc}") from exc
 

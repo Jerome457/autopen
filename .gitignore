@@ -5,7 +5,11 @@ data/credentials.txt
 data/*.pcap
 data/*.pcapng
 data/*.db
+data/*.backup
+
+data/assessments/
 
 reports/*.html
+reports/assessments/
 
 .env

@@ -55,7 +55,8 @@ class CredentialTestTests(unittest.TestCase):
         result = parse_hydra_output(SUCCESS_OUTPUT, 22, "autopen-test")
 
         self.assertTrue(result["credential_found"])
-        self.assertEqual(result["matched_password"], "lab-secret")
+        self.assertEqual(result["outcome"], "matched")
+        self.assertNotIn("matched_password", result)
 
     def test_no_match_parsing(self) -> None:
         result = parse_hydra_output(
@@ -63,7 +64,8 @@ class CredentialTestTests(unittest.TestCase):
         )
 
         self.assertFalse(result["credential_found"])
-        self.assertIsNone(result["matched_password"])
+        self.assertEqual(result["outcome"], "no_match")
+        self.assertNotIn("matched_password", result)
 
     def test_unexpected_output_is_rejected(self) -> None:
         with self.assertRaisesRegex(CredentialTestError, "unexpected output"):

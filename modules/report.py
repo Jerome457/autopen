@@ -42,10 +42,17 @@ def _credential_table(credentials: list[sqlite3.Row]) -> str:
     if not credentials:
         return '<p class="empty">No credential testing results were recorded.</p>'
     rows = []
+    labels = {
+        "matched": ("Credential matched", "success"),
+        "no_match": ("No credential matched", "neutral"),
+        "skipped": ("Skipped", "neutral"),
+        "failed": ("Failed", "neutral"),
+        "timed_out": ("Timed out", "neutral"),
+    }
     for result in credentials:
-        matched = bool(result["credential_found"])
-        badge_class = "success" if matched else "neutral"
-        label = "Credential matched" if matched else "No credential matched"
+        label, badge_class = labels.get(
+            result["outcome"], (str(result["outcome"]), "neutral")
+        )
         badge = f'<span class="badge {badge_class}">{label}</span>'
         rows.append(
             "<tr>"
@@ -78,13 +85,22 @@ def generate_report(
             connection.row_factory = sqlite3.Row
             assessment = connection.execute(
                 """
-                SELECT id, target, started_at, finished_at
+                SELECT id, target, started_at, finished_at, status
                 FROM assessments WHERE id = ?
                 """,
                 (assessment_id,),
             ).fetchone()
             if assessment is None:
                 raise ReportError(f"Assessment {assessment_id} does not exist.")
+
+            host = connection.execute(
+                """
+                SELECT id, target, interface, status, started_at, finished_at,
+                       error_summary
+                FROM assessment_hosts WHERE assessment_id = ? ORDER BY id LIMIT 1
+                """,
+                (assessment_id,),
+            ).fetchone()
 
             services = connection.execute(
                 """
@@ -95,7 +111,7 @@ def generate_report(
             ).fetchall()
             credentials = connection.execute(
                 """
-                SELECT service, port, username, credential_found
+                SELECT service, port, username, outcome, credential_found
                 FROM credential_results WHERE assessment_id = ? ORDER BY id
                 """,
                 (assessment_id,),
@@ -127,6 +143,13 @@ def generate_report(
                 GROUP BY src_ip, src_port, dst_ip, dst_port, protocol
                 ORDER BY packet_count DESC, protocol, src_ip, src_port
                 LIMIT 10
+                """,
+                (assessment_id,),
+            ).fetchall()
+            artifact_rows = connection.execute(
+                """
+                SELECT artifact_type, path, status FROM artifacts
+                WHERE assessment_id = ? ORDER BY id
                 """,
                 (assessment_id,),
             ).fetchall()
@@ -164,22 +187,29 @@ def generate_report(
         if str(row["service"]).lower() == "ssh"
         and str(row["protocol"]).lower() == "tcp"
     ]
-    matched_credentials = [row for row in credentials if row["credential_found"]]
+    credential_outcomes = {row["outcome"] for row in credentials}
+    artifacts = {row["artifact_type"]: row for row in artifact_rows}
 
     summary_items = [f"{len(open_services):,} open services were identified."]
     if ssh_services:
         ports = ", ".join(str(row["port"]) for row in ssh_services)
         summary_items.append(f"SSH was available on TCP port {ports}.")
     if credentials:
-        if matched_credentials:
+        if "matched" in credential_outcomes:
             summary_items.append(
                 "The controlled SSH credential test matched a credential for the "
                 "configured lab account."
             )
-        else:
+        elif "no_match" in credential_outcomes:
             summary_items.append(
                 "The controlled SSH credential test did not match a credential."
             )
+        elif "timed_out" in credential_outcomes:
+            summary_items.append("The controlled SSH credential test timed out.")
+        elif "failed" in credential_outcomes:
+            summary_items.append("The controlled SSH credential test failed.")
+        else:
+            summary_items.append("The controlled SSH credential test was skipped.")
     else:
         summary_items.append("No credential test result was recorded.")
     summary_items.append(
@@ -209,6 +239,8 @@ def generate_report(
         "No connections were available for this assessment.",
     )
     summary_html = "".join(f"<li>{html.escape(item)}</li>" for item in summary_items)
+    pcap_path = artifacts.get("pcap")["path"] if "pcap" in artifacts else DEFAULT_PCAP_PATH
+    host_status = host["status"] if host is not None else "legacy_unknown"
 
     document = f"""<!doctype html>
 <html lang="en">
@@ -267,6 +299,8 @@ def generate_report(
     <div class="meta-card"><span class="label">Target IP</span><span class="value">{_escape(assessment['target'])}</span></div>
     <div class="meta-card"><span class="label">Started</span><span class="value">{_escape(assessment['started_at'])}</span></div>
     <div class="meta-card"><span class="label">Finished</span><span class="value">{_escape(assessment['finished_at'])}</span></div>
+    <div class="meta-card"><span class="label">Assessment status</span><span class="value">{_escape(assessment['status'])}</span></div>
+    <div class="meta-card"><span class="label">Host status</span><span class="value">{_escape(host_status)}</span></div>
   </div>
 
   <div class="stats" aria-label="Traffic statistics">
@@ -282,7 +316,7 @@ def generate_report(
   <section><h2>Top Connections</h2>{connection_table}</section>
   <section><h2>Security / Assessment Summary</h2><ul class="summary">{summary_html}</ul></section>
   <section class="artifacts"><h2>Artifacts</h2>
-    <p><strong>PCAP:</strong> <code>{_escape(DEFAULT_PCAP_PATH)}</code></p>
+    <p><strong>PCAP:</strong> <code>{_escape(pcap_path)}</code></p>
     <p><strong>Database:</strong> <code>{_escape(database_path)}</code></p>
     <p><strong>Report:</strong> <code>{_escape(output_path)}</code></p>
   </section>

@@ -304,7 +304,7 @@ Typical output:
 [+] Test credential matched
 
 [*] Stopping traffic capture...
-[+] Capture saved: data/capture.pcap
+[+] Capture saved: data/assessments/<assessment-id>/capture.pcap
 
 [*] Parsing captured traffic...
 [+] <N> packets parsed
@@ -313,7 +313,7 @@ Typical output:
 [+] Assessment stored in data/autopen.db
 
 [*] Generating consolidated report...
-[+] Report saved: reports/report.html
+[+] Report saved: reports/assessments/<assessment-id>/report.html
 
 [✓] Assessment complete
 ```
@@ -327,27 +327,34 @@ Packet counts and discovered services will differ between machines.
 A successful run produces:
 
 ```text
-data/capture.pcap
+data/assessments/<assessment-id>/capture.pcap
 data/autopen.db
-reports/report.html
+reports/assessments/<assessment-id>/report.html
 ```
+
+Artifacts are preserved by assessment ID and are not overwritten by later runs.
+The pre-foundation legacy files `data/capture.pcap` and `reports/report.html` are
+left untouched and are not attached to historical assessments because their exact
+provenance cannot be established.
 
 ### HTML Report
 
+Open the report path printed by AutoPen, for example:
+
 ```bash
-firefox reports/report.html
+firefox reports/assessments/7/report.html
 ```
 
 ### PCAP
 
 ```bash
-wireshark data/capture.pcap
+wireshark data/assessments/7/capture.pcap
 ```
 
 or:
 
 ```bash
-tshark -r data/capture.pcap | head
+tshark -r data/assessments/7/capture.pcap | head
 ```
 
 ### SQLite
@@ -376,6 +383,47 @@ Exit:
 ```sql
 .quit
 ```
+
+---
+
+# Database Compatibility and Execution Status
+
+AutoPen uses ordered, transactional SQLite migrations recorded in
+`schema_migrations`. Before an existing older database is migrated, AutoPen creates
+a consistent SQLite backup next to it using the SQLite backup API. Initialization is
+idempotent, and AutoPen refuses to open a database whose schema version is newer than
+the application supports.
+
+`assessments.target` is retained as a legacy primary-target field so existing data
+and the current single-target CLI remain compatible. It must never contain a
+comma-separated target list. New host-scoped data is stored in `assessment_hosts`.
+
+Assessment and host statuses have these meanings:
+
+- `running`: execution is currently in progress.
+- `completed`: all required stages completed; an optional credential test may be skipped.
+- `partial`: useful evidence exists, but an attempted or required stage failed.
+- `failed`: no complete host assessment was produced.
+- `interrupted`: the run was cancelled before normal completion.
+- `legacy_unknown`: migrated historical evidence does not prove its execution outcome.
+
+Credential outcomes are stored independently:
+
+- `matched`
+- `no_match`
+- `skipped`
+- `failed`
+- `timed_out`
+
+Only an actual Hydra no-match result becomes `no_match`. A skipped, failed, absent,
+or timed-out test is never converted into a successful no-match result. Plaintext
+candidate and matched passwords are not stored in SQLite, phase errors, or reports.
+
+`assessment_phases` stores precise UTC start/end windows for capture,
+reconnaissance, credential testing, PCAP parsing, storage, and report generation.
+Capture can overlap reconnaissance and credential phases. Packets intentionally keep
+their original assessment ID, addresses, and timestamps rather than receiving a
+guessed host or phase assignment.
 
 ---
 
@@ -466,11 +514,11 @@ IS_project/
 │
 ├── data/
 │   ├── credentials.txt      # local test data — don't commit
-│   ├── capture.pcap         # generated
+│   ├── assessments/         # preserved per-assessment PCAPs
 │   └── autopen.db           # generated
 │
 └── reports/
-    └── report.html          # generated
+    └── assessments/         # preserved per-assessment reports
 ```
 
 ---
@@ -483,8 +531,11 @@ Do **not** commit:
 .venv/
 data/credentials.txt
 data/capture.pcap
+data/assessments/
 data/autopen.db
+data/*.backup
 reports/report.html
+reports/assessments/
 __pycache__/
 *.pyc
 ```

@@ -68,6 +68,25 @@ class CaptureTests(unittest.TestCase):
         process.terminate.assert_called_once_with()
         process.kill.assert_not_called()
 
+    @patch("modules.capture.time.sleep", side_effect=KeyboardInterrupt)
+    @patch("modules.capture.subprocess.Popen")
+    @patch("modules.capture.shutil.which", return_value="/usr/bin/tshark")
+    def test_startup_interrupt_terminates_spawned_capture(
+        self, _which: Mock, popen: Mock, _sleep: Mock
+    ) -> None:
+        process = popen.return_value
+        process.poll.return_value = None
+        process.communicate.return_value = ("", "")
+
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(KeyboardInterrupt):
+                start_capture(
+                    "lo", Path(directory) / "capture.pcap", startup_delay=1
+                )
+
+        process.terminate.assert_called_once_with()
+        process.communicate.assert_called_once_with(timeout=5)
+
 
 if __name__ == "__main__":
     unittest.main()
