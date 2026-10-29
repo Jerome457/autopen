@@ -22,15 +22,19 @@ class CaptureTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "capture.pcap"
-            session = start_capture("lo", output)
+            session = start_capture("lo", output, capture_filter="(host 127.0.0.1)")
 
         self.assertEqual(session.interface, "lo")
         popen.assert_called_once_with(
-            ["/usr/bin/tshark", "-i", "lo", "-F", "pcap", "-w", str(output), "-q"],
+            [
+                "/usr/bin/tshark", "-i", "lo", "-f", "(host 127.0.0.1)",
+                "-F", "pcap", "-w", str(output), "-q",
+            ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
         )
+        self.assertEqual(session.capture_filter, "(host 127.0.0.1)")
 
     @patch("modules.capture.shutil.which", return_value=None)
     def test_start_capture_requires_tshark(self, _which: Mock) -> None:

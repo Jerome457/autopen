@@ -93,25 +93,25 @@ def generate_report(
             if assessment is None:
                 raise ReportError(f"Assessment {assessment_id} does not exist.")
 
-            host = connection.execute(
+            hosts = connection.execute(
                 """
                 SELECT id, target, interface, status, started_at, finished_at,
                        error_summary
-                FROM assessment_hosts WHERE assessment_id = ? ORDER BY id LIMIT 1
+                FROM assessment_hosts WHERE assessment_id = ? ORDER BY id
                 """,
                 (assessment_id,),
-            ).fetchone()
+            ).fetchall()
 
             services = connection.execute(
                 """
-                SELECT port, protocol, state, service, version
+                SELECT host_id, port, protocol, state, service, version
                 FROM services WHERE assessment_id = ? ORDER BY port, protocol
                 """,
                 (assessment_id,),
             ).fetchall()
             credentials = connection.execute(
                 """
-                SELECT service, port, username, outcome, credential_found
+                SELECT host_id, service, port, username, outcome, credential_found
                 FROM credential_results WHERE assessment_id = ? ORDER BY id
                 """,
                 (assessment_id,),
@@ -158,10 +158,6 @@ def generate_report(
     except sqlite3.Error as exc:
         raise ReportError(f"Unable to query assessment data: {exc}") from exc
 
-    service_rows = [
-        tuple(row[column] for column in ("port", "protocol", "state", "service", "version"))
-        for row in services
-    ]
     protocol_table_rows = [
         (row["protocol"], row["packet_count"]) for row in protocol_rows
     ]
@@ -216,10 +212,60 @@ def generate_report(
         f"{total_packets:,} packets were captured and stored for forensic analysis."
     )
 
-    service_table = _table_or_empty(
-        ("Port", "Protocol", "State", "Service", "Version"),
-        service_rows,
-        "No services were recorded for this assessment.",
+    host_summary_rows: list[tuple[Any, ...]] = []
+    host_sections: list[str] = []
+    if hosts:
+        for host in hosts:
+            host_services = [row for row in services if row["host_id"] == host["id"]]
+            host_credentials = [
+                row for row in credentials if row["host_id"] == host["id"]
+            ]
+            open_count = sum(
+                str(row["state"]).lower() == "open" for row in host_services
+            )
+            outcomes = ", ".join(
+                dict.fromkeys(str(row["outcome"]) for row in host_credentials)
+            ) or "not recorded"
+            host_summary_rows.append(
+                (host["target"], host["status"], open_count, outcomes)
+            )
+            service_rows = [
+                tuple(
+                    row[column]
+                    for column in ("port", "protocol", "state", "service", "version")
+                )
+                for row in host_services
+            ]
+            service_table = _table_or_empty(
+                ("Port", "Protocol", "State", "Service", "Version"),
+                service_rows,
+                "No services were recorded for this host.",
+            )
+            host_sections.append(
+                '<section class="host-result">'
+                f"<h2>Host: {_escape(host['target'])}</h2>"
+                f"<p><strong>Execution status:</strong> {_escape(host['status'])}</p>"
+                f"<h3>Services</h3>{service_table}"
+                f"<h3>Credential Testing</h3>{_credential_table(host_credentials)}"
+                "</section>"
+            )
+    else:
+        host_summary_rows.append((assessment["target"], "legacy_unknown", len(open_services), "not recorded"))
+        service_rows = [
+            tuple(row[column] for column in ("port", "protocol", "state", "service", "version"))
+            for row in services
+        ]
+        host_sections.append(
+            '<section class="host-result">'
+            f"<h2>Host: {_escape(assessment['target'])}</h2>"
+            f"<h3>Services</h3>{_table_or_empty(('Port', 'Protocol', 'State', 'Service', 'Version'), service_rows, 'No services were recorded for this host.')}"
+            f"<h3>Credential Testing</h3>{_credential_table(credentials)}"
+            "</section>"
+        )
+    host_summary_table = _table_or_empty(
+        ("Target", "Execution Status", "Open Services", "Credential Outcomes"),
+        host_summary_rows,
+        "No hosts were recorded for this assessment.",
     )
     protocol_table = _table_or_empty(
         ("Protocol", "Packets"),
@@ -240,7 +286,10 @@ def generate_report(
     )
     summary_html = "".join(f"<li>{html.escape(item)}</li>" for item in summary_items)
     pcap_path = artifacts.get("pcap")["path"] if "pcap" in artifacts else DEFAULT_PCAP_PATH
-    host_status = host["status"] if host is not None else "legacy_unknown"
+    host_sections_html = "".join(host_sections)
+    host_status_label = ", ".join(
+        dict.fromkeys(str(row[1]) for row in host_summary_rows)
+    )
 
     document = f"""<!doctype html>
 <html lang="en">
@@ -296,11 +345,12 @@ def generate_report(
 
   <div class="meta" aria-label="Assessment metadata">
     <div class="meta-card"><span class="label">Assessment ID</span><span class="value">{_escape(assessment['id'])}</span></div>
-    <div class="meta-card"><span class="label">Target IP</span><span class="value">{_escape(assessment['target'])}</span></div>
+    <div class="meta-card"><span class="label">Primary target (legacy)</span><span class="value">{_escape(assessment['target'])}</span></div>
+    <div class="meta-card"><span class="label">Total targets</span><span class="value">{len(host_summary_rows)}</span></div>
     <div class="meta-card"><span class="label">Started</span><span class="value">{_escape(assessment['started_at'])}</span></div>
     <div class="meta-card"><span class="label">Finished</span><span class="value">{_escape(assessment['finished_at'])}</span></div>
     <div class="meta-card"><span class="label">Assessment status</span><span class="value">{_escape(assessment['status'])}</span></div>
-    <div class="meta-card"><span class="label">Host status</span><span class="value">{_escape(host_status)}</span></div>
+    <div class="meta-card"><span class="label">Host status</span><span class="value">{_escape(host_status_label)}</span></div>
   </div>
 
   <div class="stats" aria-label="Traffic statistics">
@@ -310,9 +360,9 @@ def generate_report(
     <div class="stat"><span class="label">Destination IPs</span><span class="value">{address_counts[1]:,}</span></div>
   </div>
 
-  <section><h2>Reconnaissance</h2>{service_table}</section>
-  <section><h2>Credential Testing</h2>{_credential_table(credentials)}</section>
-  <section><h2>Traffic Forensics</h2>{protocol_table}</section>
+  <section><h2>Host Summary</h2>{host_summary_table}</section>
+  {host_sections_html}
+  <section><h2>Assessment-wide Traffic Forensics</h2>{protocol_table}</section>
   <section><h2>Top Connections</h2>{connection_table}</section>
   <section><h2>Security / Assessment Summary</h2><ul class="summary">{summary_html}</ul></section>
   <section class="artifacts"><h2>Artifacts</h2>

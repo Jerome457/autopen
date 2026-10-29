@@ -38,24 +38,33 @@ from modules.recon import ReconError, run_recon, validate_target
 from modules.report import ReportError, generate_report
 
 
-def target_ip(value: str) -> str:
-    """Argparse adapter for single-IP validation."""
-    try:
-        return validate_target(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(str(exc)) from exc
+def normalize_targets(values: Sequence[str]) -> list[str]:
+    """Validate, normalize, and order-deduplicate explicit IP targets."""
+    targets: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = validate_target(value)
+        if normalized not in seen:
+            seen.add(normalized)
+            targets.append(normalized)
+    return targets
+
+
+def capture_filter_for(targets: Sequence[str]) -> str:
+    """Build a BPF host filter containing only explicitly supplied addresses."""
+    return "(" + " or ".join(f"host {target}" for target in targets) + ")"
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Create the backward-compatible single-target parser."""
+    """Create the parser for one or more explicit targets."""
     parser = argparse.ArgumentParser(
         description="Run AutoPen reconnaissance against an explicit lab target."
     )
     parser.add_argument(
         "--target",
         required=True,
-        type=target_ip,
-        help="one IPv4 or IPv6 address belonging to the isolated lab",
+        action="append",
+        help="explicit IPv4 or IPv6 address; repeat for multiple lab targets",
     )
     parser.add_argument(
         "--interface",
@@ -100,23 +109,43 @@ def _display_services(services: list[dict[str, object]]) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run one explicit target while persisting host, phase, and artifact outcomes."""
+    """Run one assessment over explicitly supplied targets, sequentially."""
     parser = build_parser()
     args = parser.parse_args(argv)
+    try:
+        targets = normalize_targets(args.target)
+    except ValueError as exc:
+        parser.error(str(exc))
     if bool(args.ssh_user) != bool(args.password_list):
         parser.error("--ssh-user and --password-list must be supplied together")
+
+    loopback_flags = [ipaddress.ip_address(target).is_loopback for target in targets]
+    if any(loopback_flags) and not all(loopback_flags):
+        parser.error(
+            "Loopback and non-loopback targets cannot be mixed in one assessment; "
+            "they require different capture interfaces."
+        )
     interface = args.interface
-    if interface is None and ipaddress.ip_address(args.target).is_loopback:
+    if interface is None and all(loopback_flags):
         interface = "lo"
     if interface is None:
         parser.error("--interface is required for non-loopback targets; choose it explicitly")
 
     print("[*] AutoPen starting")
-    print(f"[*] Target: {args.target}")
+    print(f"[*] Targets ({len(targets)}): {', '.join(targets)}")
 
     try:
-        assessment_id = create_assessment(args.target)
-        host_id = create_assessment_host(assessment_id, args.target, interface)
+        assessment_id = create_assessment(targets[0])
+        hosts = [
+            {
+                "id": create_assessment_host(assessment_id, target, interface),
+                "target": target,
+                "status": "running",
+                "services": [],
+                "errors": [],
+            }
+            for target in targets
+        ]
         paths = assessment_artifact_paths(assessment_id)
         capture_artifact_id = register_artifact(
             assessment_id, "pcap", paths.capture
@@ -133,116 +162,126 @@ def main(argv: Sequence[str] | None = None) -> int:
                 pass
         return 1
 
-    services: list[dict[str, object]] = []
-    errors: list[str] = []
+    all_services: list[dict[str, object]] = []
+    shared_errors: list[str] = []
     interrupted = False
     capture_available = False
-    recon_ok = False
-    credential_ok = False
     parse_ok = False
     packet_store_ok = False
     capture = None
 
     print(f"\n[*] Starting traffic capture on {interface}...")
-    capture_phase = start_phase(assessment_id, "capture", host_id)
+    capture_phase = start_phase(assessment_id, "capture")
     try:
         try:
-            capture = start_capture(interface, paths.capture)
+            capture = start_capture(
+                interface,
+                paths.capture,
+                capture_filter=capture_filter_for(targets),
+            )
         except CaptureError as exc:
-            errors.append(str(exc))
+            shared_errors.append(str(exc))
             finish_phase(capture_phase, "failed", exc)
             update_artifact_status(capture_artifact_id, "failed")
             print(f"[-] {exc}", file=sys.stderr)
         except KeyboardInterrupt:
             interrupted = True
-            errors.append("Capture startup interrupted.")
+            shared_errors.append("Capture startup interrupted.")
             finish_phase(capture_phase, "interrupted", "Capture startup interrupted.")
             update_artifact_status(capture_artifact_id, "incomplete")
         else:
-            print("\n[*] Running reconnaissance...")
-            recon_phase = start_phase(assessment_id, "reconnaissance", host_id)
-            try:
-                services = run_recon(args.target)
-                insert_services(
-                    assessment_id, services, host_id=host_id
-                )
-                recon_ok = True
-                finish_phase(recon_phase, "completed")
-                _display_services(services)
-            except KeyboardInterrupt:
-                interrupted = True
-                errors.append("Reconnaissance interrupted.")
-                finish_phase(recon_phase, "interrupted", "Reconnaissance interrupted.")
-            except (ReconError, DatabaseError) as exc:
-                errors.append(str(exc))
-                finish_phase(recon_phase, "failed", exc)
-                print(f"[-] {exc}", file=sys.stderr)
+            for host in hosts:
+                if interrupted:
+                    break
+                host_id = int(host["id"])
+                target = str(host["target"])
+                print(f"\n[*] Running reconnaissance for {target}...")
+                recon_phase = start_phase(assessment_id, "reconnaissance", host_id)
+                recon_ok = False
+                try:
+                    services = run_recon(target)
+                    insert_services(assessment_id, services, host_id=host_id)
+                    host["services"] = services
+                    all_services.extend(services)
+                    recon_ok = True
+                    finish_phase(recon_phase, "completed")
+                    _display_services(services)
+                except KeyboardInterrupt:
+                    interrupted = True
+                    host["errors"].append("Reconnaissance interrupted.")
+                    host["status"] = "interrupted"
+                    finish_phase(recon_phase, "interrupted", "Reconnaissance interrupted.")
+                except (ReconError, DatabaseError) as exc:
+                    host["errors"].append(str(exc))
+                    host["status"] = "failed"
+                    finish_phase(recon_phase, "failed", exc)
+                    print(f"[-] {target}: {exc}", file=sys.stderr)
 
-            if not interrupted:
+                if interrupted:
+                    continue
+
                 credential_phase = start_phase(
                     assessment_id, "credential_testing", host_id
                 )
-                ssh_port = find_ssh_port(services) if recon_ok else None
-                credential_result: CredentialResult
-                if not args.ssh_user:
-                    credential_result = _credential_record("skipped", None, ssh_port)
-                    insert_credential_result(
-                        assessment_id, credential_result, host_id=host_id
+                ssh_port = find_ssh_port(host["services"]) if recon_ok else None
+                if not recon_ok:
+                    result = _credential_record("skipped", args.ssh_user, None)
+                    insert_credential_result(assessment_id, result, host_id=host_id)
+                    finish_phase(
+                        credential_phase,
+                        "skipped",
+                        "Reconnaissance failed; credential testing was not run.",
                     )
-                    credential_ok = True
-                    finish_phase(credential_phase, "skipped")
-                elif not recon_ok or ssh_port is None:
-                    print("[!] SSH was not discovered; credential testing skipped.")
-                    credential_result = _credential_record(
-                        "skipped", args.ssh_user, ssh_port
+                    finish_assessment_host(
+                        host_id, "failed", "; ".join(host["errors"])
                     )
-                    insert_credential_result(
-                        assessment_id, credential_result, host_id=host_id
+                    continue
+                if not args.ssh_user or ssh_port is None:
+                    result = _credential_record("skipped", args.ssh_user, ssh_port)
+                    insert_credential_result(assessment_id, result, host_id=host_id)
+                    reason = (
+                        "Optional credential testing was not configured."
+                        if not args.ssh_user
+                        else "SSH was not discovered."
                     )
-                    credential_ok = True
-                    finish_phase(credential_phase, "skipped")
+                    finish_phase(credential_phase, "skipped", reason)
+                    host["status"] = "completed"
                 else:
-                    print(f"\n[*] SSH discovered on port {ssh_port}")
-                    print("[*] Running controlled SSH credential test...")
+                    print(f"[*] Running controlled SSH credential test for {target}:{ssh_port}...")
                     try:
-                        credential_result = run_ssh_credential_test(
-                            args.target,
-                            ssh_port,
-                            args.ssh_user,
-                            args.password_list,
+                        result = run_ssh_credential_test(
+                            target, ssh_port, args.ssh_user, args.password_list
                         )
-                        insert_credential_result(
-                            assessment_id, credential_result, host_id=host_id
-                        )
-                        credential_ok = True
+                        insert_credential_result(assessment_id, result, host_id=host_id)
                         finish_phase(credential_phase, "completed")
+                        host["status"] = "completed"
                         print("[+] SSH credential test completed")
-                        if credential_result["outcome"] == "matched":
-                            print("[+] Test credential matched")
-                        else:
-                            print("[!] No test credential matched")
                     except KeyboardInterrupt:
                         interrupted = True
-                        errors.append("Credential testing interrupted.")
+                        host["errors"].append("Credential testing interrupted.")
+                        host["status"] = "interrupted"
                         finish_phase(
-                            credential_phase,
-                            "interrupted",
-                            "Credential testing interrupted.",
+                            credential_phase, "interrupted", "Credential testing interrupted."
                         )
                     except CredentialTestError as exc:
-                        errors.append(str(exc))
-                        credential_result = _credential_record(
-                            exc.outcome, args.ssh_user, ssh_port
-                        )
-                        insert_credential_result(
-                            assessment_id, credential_result, host_id=host_id
-                        )
+                        host["errors"].append(str(exc))
+                        result = _credential_record(exc.outcome, args.ssh_user, ssh_port)
+                        insert_credential_result(assessment_id, result, host_id=host_id)
                         finish_phase(credential_phase, exc.outcome, exc)
-                        print(f"[-] {exc}", file=sys.stderr)
+                        host["status"] = "partial"
+                        print(f"[-] {target}: {exc}", file=sys.stderr)
                     except DatabaseError as exc:
-                        errors.append(str(exc))
+                        host["errors"].append(str(exc))
                         finish_phase(credential_phase, "failed", exc)
-                        print(f"[-] {exc}", file=sys.stderr)
+                        host["status"] = "partial"
+                        print(f"[-] {target}: {exc}", file=sys.stderr)
+
+                if host["status"] != "interrupted":
+                    finish_assessment_host(
+                        host_id,
+                        str(host["status"]),
+                        "; ".join(host["errors"]) or None,
+                    )
     finally:
         if capture is not None:
             print("\n[*] Stopping traffic capture...")
@@ -253,22 +292,42 @@ def main(argv: Sequence[str] | None = None) -> int:
                 finish_phase(capture_phase, "completed")
                 print(f"[+] Capture saved: {capture_path}")
             except CaptureError as exc:
-                errors.append(str(exc))
+                shared_errors.append(str(exc))
                 update_artifact_status(capture_artifact_id, "failed")
                 finish_phase(capture_phase, "failed", exc)
                 print(f"[-] {exc}", file=sys.stderr)
+            except KeyboardInterrupt:
+                interrupted = True
+                shared_errors.append("Capture shutdown interrupted.")
+                update_artifact_status(capture_artifact_id, "incomplete")
+                finish_phase(capture_phase, "interrupted", "Capture shutdown interrupted.")
 
     if capture is None and not interrupted:
-        recon_skip = start_phase(assessment_id, "reconnaissance", host_id)
-        finish_phase(recon_skip, "skipped", "Capture was unavailable.")
-        credential_skip = start_phase(assessment_id, "credential_testing", host_id)
-        skipped_result = _credential_record("skipped", args.ssh_user, None)
-        insert_credential_result(assessment_id, skipped_result, host_id=host_id)
-        finish_phase(credential_skip, "skipped", "Reconnaissance was not run.")
+        for host in hosts:
+            host_id = int(host["id"])
+            reason = "Shared capture was unavailable; host processing was not started."
+            recon_skip = start_phase(assessment_id, "reconnaissance", host_id)
+            finish_phase(recon_skip, "skipped", reason)
+            credential_skip = start_phase(assessment_id, "credential_testing", host_id)
+            skipped_result = _credential_record("skipped", args.ssh_user, None)
+            insert_credential_result(assessment_id, skipped_result, host_id=host_id)
+            finish_phase(credential_skip, "skipped", reason)
+            host["status"] = "failed"
+            finish_assessment_host(host_id, "failed", reason)
 
     if interrupted:
-        host_status = "interrupted"
-        finish_assessment_host(host_id, host_status, "; ".join(errors))
+        for host in hosts:
+            if host["status"] == "running":
+                host["status"] = "interrupted"
+                host["errors"].append(
+                    "Not processed because the assessment was interrupted."
+                )
+            if host["status"] == "interrupted":
+                finish_assessment_host(
+                    int(host["id"]),
+                    "interrupted",
+                    "; ".join(host["errors"]),
+                )
         finish_assessment(assessment_id, status="interrupted")
         update_artifact_status(report_artifact_id, "incomplete")
         print("\n[!] Assessment interrupted")
@@ -276,7 +335,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if capture_available:
         print("\n[*] Parsing captured traffic...")
-        parse_phase = start_phase(assessment_id, "pcap_parsing", host_id)
+        parse_phase = start_phase(assessment_id, "pcap_parsing")
         try:
             packets = parse_pcap(paths.capture)
             parse_ok = True
@@ -284,47 +343,50 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"[+] {len(packets)} packets parsed")
         except KeyboardInterrupt:
             finish_phase(parse_phase, "interrupted", "PCAP parsing interrupted.")
-            finish_assessment_host(host_id, "interrupted", "PCAP parsing interrupted.")
             finish_assessment(assessment_id, status="interrupted")
             update_artifact_status(report_artifact_id, "incomplete")
             return 130
         except PcapParserError as exc:
-            errors.append(str(exc))
+            shared_errors.append(str(exc))
             finish_phase(parse_phase, "failed", exc)
             print(f"[-] {exc}", file=sys.stderr)
 
         if parse_ok:
             print("\n[*] Storing forensic data...")
-            storage_phase = start_phase(assessment_id, "packet_storage", host_id)
+            storage_phase = start_phase(assessment_id, "packet_storage")
             try:
                 insert_packets(assessment_id, packets)
                 packet_store_ok = True
                 finish_phase(storage_phase, "completed")
                 print(f"[+] Assessment stored in {DEFAULT_DATABASE_PATH}")
             except DatabaseError as exc:
-                errors.append(str(exc))
+                shared_errors.append(str(exc))
                 finish_phase(storage_phase, "failed", exc)
                 print(f"[-] {exc}", file=sys.stderr)
         else:
-            storage_phase = start_phase(assessment_id, "packet_storage", host_id)
+            storage_phase = start_phase(assessment_id, "packet_storage")
             finish_phase(storage_phase, "skipped", "PCAP parsing did not complete.")
     else:
-        parse_phase = start_phase(assessment_id, "pcap_parsing", host_id)
+        parse_phase = start_phase(assessment_id, "pcap_parsing")
         finish_phase(parse_phase, "skipped", "No available PCAP artifact.")
-        storage_phase = start_phase(assessment_id, "packet_storage", host_id)
+        storage_phase = start_phase(assessment_id, "packet_storage")
         finish_phase(storage_phase, "skipped", "No parsed packets were available.")
 
-    required_ok = (
-        capture_available and recon_ok and credential_ok and parse_ok and packet_store_ok
+    host_statuses = [str(host["status"]) for host in hosts]
+    required_shared_ok = capture_available and parse_ok and packet_store_ok
+    useful_results = capture_available or any(
+        status in {"completed", "partial"} for status in host_statuses
     )
-    evidence_exists = capture_available or bool(services)
-    host_status = "completed" if required_ok else "partial" if evidence_exists else "failed"
-    finish_assessment_host(host_id, host_status, "; ".join(errors) or None)
-    overall_status = host_status
+    if required_shared_ok and all(status == "completed" for status in host_statuses):
+        overall_status = "completed"
+    elif useful_results:
+        overall_status = "partial"
+    else:
+        overall_status = "failed"
     finish_assessment(assessment_id, status=overall_status)
 
     print("\n[*] Structured service information:")
-    print(json.dumps(services, indent=2))
+    print(json.dumps(all_services, indent=2))
     print("\n[*] Generating consolidated report...")
     report_phase = start_phase(assessment_id, "report_generation")
     report_path: Path | None = None
@@ -340,7 +402,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("\n[!] Assessment interrupted")
         return 130
     except ReportError as exc:
-        errors.append(str(exc))
+        shared_errors.append(str(exc))
         update_artifact_status(report_artifact_id, "failed")
         finish_phase(report_phase, "failed", exc)
         if overall_status == "completed":

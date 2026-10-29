@@ -116,10 +116,10 @@ Before making changes:
 python -m unittest discover -s tests -v
 ```
 
-The current MVP has:
+The current mocked unit-test suite has:
 
 ```text
-Ran 30 tests
+Ran 47 tests
 
 OK
 ```
@@ -291,15 +291,14 @@ Typical output:
 
 ```text
 [*] AutoPen starting
-[*] Target: 127.0.0.1
+[*] Targets (1): 127.0.0.1
 
 [*] Starting traffic capture on lo...
 
-[*] Running reconnaissance...
+[*] Running reconnaissance for 127.0.0.1...
 [+] 22/tcp OPEN - ssh - OpenSSH ...
 
-[*] SSH discovered on port 22
-[*] Running controlled SSH credential test...
+[*] Running controlled SSH credential test for 127.0.0.1:22...
 [+] SSH credential test completed
 [+] Test credential matched
 
@@ -315,10 +314,55 @@ Typical output:
 [*] Generating consolidated report...
 [+] Report saved: reports/assessments/<assessment-id>/report.html
 
-[✓] Assessment complete
+[✓] Assessment completed
 ```
 
 Packet counts and discovered services will differ between machines.
+
+## 11. Sequential Multi-Host Lab Test
+
+Supply each authorized lab address with a separate `--target`. AutoPen validates,
+normalizes, and deduplicates every address before creating an assessment or starting
+external tools:
+
+```bash
+python3 autopen.py \
+    --target 192.168.56.20 \
+    --target 192.168.56.21 \
+    --interface <lab-interface> \
+    --ssh-user autopen-test \
+    --password-list data/credentials.txt
+```
+
+Targets are processed sequentially within one assessment. A single TShark capture,
+restricted to the supplied addresses with a BPF filter, spans the host loop. The
+capture is then parsed once and its traffic statistics are assessment-wide.
+
+This milestone supports one isolated lab network and one explicit capture interface
+per assessment. It does not support target files, subnet expansion, concurrent scans,
+or per-host interfaces. Loopback-only runs automatically select `lo`; loopback and
+non-loopback targets cannot be combined.
+
+To identify the interface connected to the authorized lab network, inspect:
+
+```bash
+tshark -D
+ip address
+ip route get 192.168.56.20
+```
+
+Use the interface shown for the route to the lab target, such as a VirtualBox host-only
+interface. Do not guess an interface name or select an interface connected to an
+unauthorized network.
+
+When `--ssh-user` and `--password-list` are supplied, that same explicit lab
+configuration applies to every listed target where SSH is discovered. Both arguments
+are required together. Candidate and matched passwords are never printed or stored.
+
+Execution status describes whether collection stages ran successfully; it is not a
+security verdict. A `completed` host may have no open services, and an open service or
+matched lab credential does not by itself change execution completion. Structured
+security findings and risk analysis belong to a later milestone.
 
 ---
 
@@ -395,8 +439,9 @@ idempotent, and AutoPen refuses to open a database whose schema version is newer
 the application supports.
 
 `assessments.target` is retained as a legacy primary-target field so existing data
-and the current single-target CLI remain compatible. It must never contain a
-comma-separated target list. New host-scoped data is stored in `assessment_hosts`.
+and the single-target CLI remain compatible. For multi-host runs it contains only the
+first normalized target and must never contain a comma-separated list. All current
+host-scoped logic and reporting use `assessment_hosts`.
 
 Assessment and host statuses have these meanings:
 

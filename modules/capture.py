@@ -24,6 +24,7 @@ class CaptureSession:
     process: subprocess.Popen[str]
     output_path: Path
     interface: str
+    capture_filter: str | None = None
 
 
 def _process_error(process: subprocess.Popen[str]) -> str:
@@ -39,6 +40,7 @@ def start_capture(
     interface: str,
     output_path: Path = DEFAULT_CAPTURE_PATH,
     startup_delay: float = 1.0,
+    capture_filter: str | None = None,
 ) -> CaptureSession:
     """Start TShark on an explicit interface and write a PCAP file."""
     if not interface.strip():
@@ -56,12 +58,16 @@ def start_capture(
         tshark_binary,
         "-i",
         interface,
+    ]
+    if capture_filter:
+        command.extend(["-f", capture_filter])
+    command.extend([
         "-F",
         "pcap",
         "-w",
         str(output_path),
         "-q",
-    ]
+    ])
     try:
         process = subprocess.Popen(
             command,
@@ -90,7 +96,7 @@ def start_capture(
             f"that your user has packet-capture permission. Details: {detail}"
         )
 
-    return CaptureSession(process, output_path, interface)
+    return CaptureSession(process, output_path, interface, capture_filter)
 
 
 def stop_capture(session: CaptureSession, timeout: float = 10.0) -> Path:

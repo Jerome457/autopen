@@ -49,6 +49,96 @@ def common_mocks() -> dict[str, Mock]:
 
 
 class AutoPenTests(unittest.TestCase):
+    def test_target_normalization_and_ordered_deduplication(self) -> None:
+        self.assertEqual(
+            autopen.normalize_targets(
+                ["192.168.56.20", "2001:0db8::1", "192.168.56.20", "2001:db8::1"]
+            ),
+            ["192.168.56.20", "2001:db8::1"],
+        )
+
+    def test_invalid_target_is_rejected_before_assessment_creation(self) -> None:
+        with patch.object(autopen, "create_assessment") as create_assessment:
+            with self.assertRaises(SystemExit):
+                autopen.main(["--target", "lab-host", "--interface", "lab0"])
+        create_assessment.assert_not_called()
+
+    def test_mixed_loopback_targets_are_rejected_before_external_execution(self) -> None:
+        with patch.object(autopen, "create_assessment") as create_assessment, \
+             patch.object(autopen, "start_capture") as start_capture:
+            with self.assertRaises(SystemExit):
+                autopen.main(
+                    ["--target", "127.0.0.1", "--target", "192.168.56.20", "--interface", "lab0"]
+                )
+        create_assessment.assert_not_called()
+        start_capture.assert_not_called()
+
+    def test_multi_host_continues_after_recon_failure_and_uses_one_capture(self) -> None:
+        mocks = common_mocks()
+        mocks["create_assessment_host"] = Mock(side_effect=[10, 11])
+        mocks["run_recon"] = Mock(
+            side_effect=[autopen.ReconError("host A failed"), [IPP_SERVICE]]
+        )
+        mocks["run_ssh_credential_test"] = Mock()
+
+        with patch("builtins.print"), patch.multiple(autopen, **mocks):
+            status = autopen.main(
+                [
+                    "--target", "192.168.56.20", "--target", "192.168.56.21",
+                    "--interface", "lab0",
+                ]
+            )
+
+        self.assertEqual(status, 1)
+        mocks["create_assessment"].assert_called_once_with("192.168.56.20")
+        self.assertEqual(
+            [call.args[1] for call in mocks["create_assessment_host"].call_args_list],
+            ["192.168.56.20", "192.168.56.21"],
+        )
+        self.assertEqual(mocks["run_recon"].call_count, 2)
+        mocks["start_capture"].assert_called_once()
+        mocks["stop_capture"].assert_called_once()
+        mocks["parse_pcap"].assert_called_once()
+        capture_filter = mocks["start_capture"].call_args.kwargs["capture_filter"]
+        self.assertEqual(
+            capture_filter,
+            "(host 192.168.56.20 or host 192.168.56.21)",
+        )
+        service_call = mocks["insert_services"].call_args
+        self.assertEqual(service_call.kwargs["host_id"], 11)
+        final_hosts = {
+            call.args[0]: call.args[1]
+            for call in mocks["finish_assessment_host"].call_args_list
+        }
+        self.assertEqual(final_hosts, {10: "failed", 11: "completed"})
+        mocks["finish_assessment"].assert_called_with(1, status="partial")
+
+    def test_interrupt_marks_current_and_unprocessed_hosts(self) -> None:
+        mocks = common_mocks()
+        mocks["create_assessment_host"] = Mock(side_effect=[10, 11, 12])
+        mocks["run_recon"] = Mock(side_effect=[[IPP_SERVICE], KeyboardInterrupt])
+        mocks["run_ssh_credential_test"] = Mock()
+
+        with patch("builtins.print"), patch.multiple(autopen, **mocks):
+            status = autopen.main(
+                [
+                    "--target", "192.168.56.20", "--target", "192.168.56.21",
+                    "--target", "192.168.56.22", "--interface", "lab0",
+                ]
+            )
+
+        self.assertEqual(status, 130)
+        self.assertEqual(mocks["run_recon"].call_count, 2)
+        mocks["stop_capture"].assert_called_once()
+        final_hosts = {
+            call.args[0]: (call.args[1], call.args[2] if len(call.args) > 2 else None)
+            for call in mocks["finish_assessment_host"].call_args_list
+        }
+        self.assertEqual(final_hosts[10][0], "completed")
+        self.assertEqual(final_hosts[11][0], "interrupted")
+        self.assertEqual(final_hosts[12][0], "interrupted")
+        self.assertIn("Not processed", final_hosts[12][1])
+
     def test_credential_test_is_not_invoked_without_discovered_ssh(self) -> None:
         mocks = common_mocks()
         mocks["run_recon"] = Mock(return_value=[IPP_SERVICE])
@@ -72,7 +162,7 @@ class AutoPenTests(unittest.TestCase):
         events: list[str] = []
         mocks = common_mocks()
         mocks["start_capture"] = Mock(
-            side_effect=lambda *_args: events.append("capture-start") or Mock()
+            side_effect=lambda *_args, **_kwargs: events.append("capture-start") or Mock()
         )
         mocks["run_recon"] = Mock(
             side_effect=lambda *_args: events.append("recon") or [SSH_SERVICE]

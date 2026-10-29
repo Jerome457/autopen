@@ -196,6 +196,57 @@ class ReportTests(unittest.TestCase):
         self.assertIn("Host status", document)
         self.assertIn("partial", document)
 
+    def test_multi_host_report_separates_host_results_and_escapes_targets(self) -> None:
+        assessment_id = create_assessment(
+            "192.168.56.20", database_path=self.database_path
+        )
+        first = create_assessment_host(
+            assessment_id, "192.168.56.20", "lab0", self.database_path
+        )
+        second = create_assessment_host(
+            assessment_id, "192.168.56.21", "lab0", self.database_path
+        )
+        insert_services(
+            assessment_id,
+            [{"port": 22, "protocol": "tcp", "state": "open", "service": "ssh<a>", "version": "A"}],
+            self.database_path,
+            first,
+        )
+        insert_services(
+            assessment_id,
+            [{"port": 631, "protocol": "tcp", "state": "open", "service": "ipp&cups", "version": "B"}],
+            self.database_path,
+            second,
+        )
+        insert_credential_result(
+            assessment_id,
+            {"service": "ssh", "port": 22, "username": "lab", "outcome": "matched"},
+            self.database_path,
+            first,
+        )
+        insert_credential_result(
+            assessment_id,
+            {"service": "ssh", "port": None, "username": "lab", "outcome": "skipped"},
+            self.database_path,
+            second,
+        )
+        finish_assessment_host(first, "completed", database_path=self.database_path)
+        finish_assessment_host(second, "completed", database_path=self.database_path)
+        finish_assessment(assessment_id, database_path=self.database_path)
+
+        generate_report(self.database_path, assessment_id, self.report_path)
+        document = self.report_path.read_text(encoding="utf-8")
+
+        self.assertIn("Total targets", document)
+        self.assertIn(">2</span>", document)
+        self.assertIn("Host Summary", document)
+        self.assertIn("Host: 192.168.56.20", document)
+        self.assertIn("Host: 192.168.56.21", document)
+        self.assertIn("ssh&lt;a&gt;", document)
+        self.assertIn("ipp&amp;cups", document)
+        self.assertNotIn("ssh<a>", document)
+        self.assertIn("Assessment-wide Traffic Forensics", document)
+
 
 if __name__ == "__main__":
     unittest.main()
