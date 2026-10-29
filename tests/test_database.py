@@ -17,6 +17,7 @@ from modules.database import (
     finish_assessment_host,
     initialize_database,
     insert_credential_result,
+    insert_findings,
     insert_packets,
     insert_services,
     register_artifact,
@@ -121,9 +122,9 @@ class DatabaseTests(unittest.TestCase):
                 )
             }
 
-        self.assertEqual(versions, [(1,), (2,)])
+        self.assertEqual(versions, [(1,), (2,), (3,)])
         self.assertTrue(
-            {"assessment_hosts", "assessment_phases", "artifacts"}.issubset(tables)
+            {"assessment_hosts", "assessment_phases", "artifacts", "findings"}.issubset(tables)
         )
 
     def test_populated_legacy_migration_preserves_and_backfills(self) -> None:
@@ -131,7 +132,7 @@ class DatabaseTests(unittest.TestCase):
 
         initialize_database(self.database_path)
 
-        backup = self.database_path.with_suffix(".db.pre-v2.backup")
+        backup = self.database_path.with_suffix(".db.pre-v3.backup")
         with sqlite3.connect(self.database_path) as connection:
             assessment = connection.execute(
                 "SELECT id,target,status FROM assessments WHERE id=7"
@@ -150,6 +151,7 @@ class DatabaseTests(unittest.TestCase):
             packet = connection.execute(
                 "SELECT id,assessment_id FROM packets WHERE id=17"
             ).fetchone()
+            finding_count = connection.execute("SELECT COUNT(*) FROM findings").fetchone()[0]
 
         self.assertTrue(backup.is_file())
         self.assertEqual(assessment, (7, "127.0.0.1", "legacy_unknown"))
@@ -157,6 +159,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(service, (11, 7, host[0]))
         self.assertEqual(credential, (13, host[0], "matched", 1))
         self.assertEqual(packet, (17, 7))
+        self.assertEqual(finding_count, 0)
 
     def test_repeated_legacy_initialization_does_not_duplicate_backfill(self) -> None:
         self._create_populated_legacy_database()
@@ -168,6 +171,40 @@ class DatabaseTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM assessment_hosts WHERE assessment_id=7"
             ).fetchone()[0]
         self.assertEqual(hosts, 1)
+
+    def test_version_two_migration_preserves_records_without_fabricating_findings(self) -> None:
+        assessment_id = create_assessment("127.0.0.1", database_path=self.database_path)
+        host_id = create_assessment_host(
+            assessment_id, "127.0.0.1", "lo", self.database_path
+        )
+        insert_services(
+            assessment_id,
+            [{"port": 22, "protocol": "tcp", "state": "open", "service": "ssh"}],
+            self.database_path,
+            host_id,
+        )
+        with sqlite3.connect(self.database_path) as connection:
+            service_before = connection.execute(
+                "SELECT id,assessment_id,host_id,port,service FROM services"
+            ).fetchall()
+            connection.execute("DROP TABLE findings")
+            connection.execute("DROP INDEX idx_services_identity_assessment")
+            connection.execute("DELETE FROM schema_migrations WHERE version=3")
+
+        initialize_database(self.database_path)
+
+        with sqlite3.connect(self.database_path) as connection:
+            service_after = connection.execute(
+                "SELECT id,assessment_id,host_id,port,service FROM services"
+            ).fetchall()
+            findings = connection.execute("SELECT COUNT(*) FROM findings").fetchone()[0]
+            versions = connection.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            ).fetchall()
+        self.assertEqual(service_after, service_before)
+        self.assertEqual(findings, 0)
+        self.assertEqual(versions, [(1,), (2,), (3,)])
+        self.assertTrue(self.database_path.with_suffix(".db.pre-v3.backup").is_file())
 
     def test_migration_failure_rolls_back_failed_version(self) -> None:
         self._create_populated_legacy_database()
@@ -238,7 +275,7 @@ class DatabaseTests(unittest.TestCase):
     def test_cross_assessment_host_associations_are_rejected(self) -> None:
         first = create_assessment("127.0.0.1", database_path=self.database_path)
         second = create_assessment("127.0.0.2", database_path=self.database_path)
-        create_assessment_host(first, "127.0.0.1", "lo", self.database_path)
+        first_host = create_assessment_host(first, "127.0.0.1", "lo", self.database_path)
         second_host = create_assessment_host(second, "127.0.0.2", "lo", self.database_path)
 
         with self.assertRaisesRegex(DatabaseError, "FOREIGN KEY"):
@@ -254,6 +291,35 @@ class DatabaseTests(unittest.TestCase):
                 {"service": "ssh", "outcome": "failed"},
                 self.database_path,
                 second_host,
+            )
+        insert_services(
+            second,
+            [{"port": 80, "protocol": "tcp", "state": "open", "service": "http"}],
+            self.database_path,
+            second_host,
+        )
+        with sqlite3.connect(self.database_path) as connection:
+            second_service = connection.execute(
+                "SELECT id FROM services WHERE assessment_id=?", (second,)
+            ).fetchone()[0]
+        with self.assertRaisesRegex(DatabaseError, "FOREIGN KEY"):
+            insert_findings(
+                first,
+                [{
+                    "host_id": first_host,
+                    "service_id": second_service,
+                    "rule_id": "TEST.CROSS_ASSESSMENT",
+                    "dedupe_key": "test",
+                    "title": "test",
+                    "severity": "low",
+                    "confidence": "low",
+                    "evidence_state": "potential_issue",
+                    "description": "test",
+                    "evidence": {},
+                    "impact": "test",
+                    "remediation": "test",
+                }],
+                self.database_path,
             )
 
     def test_nonmatch_is_reserved_for_evidenced_no_match(self) -> None:

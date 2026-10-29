@@ -8,6 +8,7 @@ import autopen
 from modules.capture import CaptureError
 from modules.credential_test import CredentialTestError
 from modules.report import ReportError
+from modules.security_analysis import SecurityAnalysisError
 
 
 SSH_SERVICE = {
@@ -44,6 +45,7 @@ def common_mocks() -> dict[str, Mock]:
         "update_assessment_status": Mock(),
         "update_artifact_status": Mock(),
         "parse_pcap": Mock(return_value=[]),
+        "analyze_assessment": Mock(return_value=0),
         "generate_report": Mock(return_value=Path("reports/assessments/1/report.html")),
     }
 
@@ -257,6 +259,25 @@ class AutoPenTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertEqual(mocks["finish_assessment_host"].call_args.args[1], "completed")
         mocks["update_assessment_status"].assert_called_with(1, "partial")
+
+    def test_analysis_failure_preserves_host_results_and_marks_assessment_partial(self) -> None:
+        mocks = common_mocks()
+        mocks["run_recon"] = Mock(return_value=[IPP_SERVICE])
+        mocks["run_ssh_credential_test"] = Mock()
+        mocks["analyze_assessment"] = Mock(
+            side_effect=SecurityAnalysisError("analysis unavailable")
+        )
+
+        with patch("builtins.print"), patch.multiple(autopen, **mocks):
+            status = autopen.main(["--target", "127.0.0.1", "--interface", "lo"])
+
+        self.assertEqual(status, 1)
+        self.assertEqual(mocks["finish_assessment_host"].call_args.args[1], "completed")
+        mocks["finish_assessment"].assert_called_with(1, status="partial")
+        self.assertTrue(
+            any(call.args[1] == "failed" for call in mocks["finish_phase"].call_args_list)
+        )
+        mocks["generate_report"].assert_called_once()
 
 
 if __name__ == "__main__":

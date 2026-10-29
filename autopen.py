@@ -36,6 +36,7 @@ from modules.database import (
 from modules.pcap_parser import PcapParserError, parse_pcap
 from modules.recon import ReconError, run_recon, validate_target
 from modules.report import ReportError, generate_report
+from modules.security_analysis import SecurityAnalysisError, analyze_assessment
 
 
 def normalize_targets(values: Sequence[str]) -> list[str]:
@@ -383,6 +384,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         overall_status = "partial"
     else:
         overall_status = "failed"
+
+    print("\n[*] Analyzing stored security evidence...")
+    analysis_phase = start_phase(assessment_id, "security_analysis")
+    try:
+        finding_count = analyze_assessment(DEFAULT_DATABASE_PATH, assessment_id)
+        finish_phase(analysis_phase, "completed")
+        print(f"[+] {finding_count} new findings stored")
+    except KeyboardInterrupt:
+        finish_phase(analysis_phase, "interrupted", "Security analysis interrupted.")
+        finish_assessment(assessment_id, status="interrupted")
+        update_artifact_status(report_artifact_id, "incomplete")
+        print("\n[!] Assessment interrupted")
+        return 130
+    except SecurityAnalysisError as exc:
+        shared_errors.append(str(exc))
+        finish_phase(analysis_phase, "failed", exc)
+        if useful_results:
+            overall_status = "partial"
+        print(f"[-] {exc}", file=sys.stderr)
+
     finish_assessment(assessment_id, status=overall_status)
 
     print("\n[*] Structured service information:")

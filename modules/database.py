@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import json
 import sqlite3
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
@@ -11,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_DATABASE_PATH = Path("data/autopen.db")
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 # running: in progress; completed: all required stages succeeded; partial: useful
 # evidence exists but a stage failed; failed: no complete host result; interrupted:
@@ -24,6 +25,9 @@ PHASE_STATUSES = (
 )
 CREDENTIAL_OUTCOMES = ("matched", "no_match", "skipped", "failed", "timed_out")
 ARTIFACT_STATUSES = ("pending", "available", "incomplete", "failed")
+FINDING_SEVERITIES = ("high", "medium", "low", "informational")
+FINDING_CONFIDENCES = ("high", "medium", "low")
+EVIDENCE_STATES = ("confirmed_observation", "potential_issue")
 
 
 class DatabaseError(RuntimeError):
@@ -180,9 +184,44 @@ def _migration_2(connection: sqlite3.Connection) -> None:
     connection.execute("CREATE INDEX idx_artifacts_assessment ON artifacts(assessment_id)")
 
 
+def _migration_3(connection: sqlite3.Connection) -> None:
+    """Add deterministic, host-scoped security findings without backfilling history."""
+    severity_values = ", ".join(f"'{value}'" for value in FINDING_SEVERITIES)
+    confidence_values = ", ".join(f"'{value}'" for value in FINDING_CONFIDENCES)
+    evidence_values = ", ".join(f"'{value}'" for value in EVIDENCE_STATES)
+    connection.execute(
+        "CREATE UNIQUE INDEX idx_services_identity_assessment "
+        "ON services(id, assessment_id, host_id)"
+    )
+    connection.execute(f"""CREATE TABLE findings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        assessment_id INTEGER NOT NULL,
+        host_id INTEGER NOT NULL,
+        service_id INTEGER,
+        rule_id TEXT NOT NULL,
+        dedupe_key TEXT NOT NULL,
+        title TEXT NOT NULL,
+        severity TEXT NOT NULL CHECK (severity IN ({severity_values})),
+        confidence TEXT NOT NULL CHECK (confidence IN ({confidence_values})),
+        evidence_state TEXT NOT NULL CHECK (evidence_state IN ({evidence_values})),
+        description TEXT NOT NULL,
+        evidence TEXT NOT NULL,
+        impact TEXT NOT NULL,
+        remediation TEXT NOT NULL,
+        UNIQUE (assessment_id, host_id, rule_id, dedupe_key),
+        FOREIGN KEY (assessment_id) REFERENCES assessments(id) ON DELETE CASCADE,
+        FOREIGN KEY (host_id, assessment_id)
+            REFERENCES assessment_hosts(id, assessment_id) ON DELETE CASCADE,
+        FOREIGN KEY (service_id, assessment_id, host_id)
+            REFERENCES services(id, assessment_id, host_id) ON DELETE CASCADE)""")
+    connection.execute("CREATE INDEX idx_findings_assessment ON findings(assessment_id)")
+    connection.execute("CREATE INDEX idx_findings_host ON findings(host_id)")
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migration_1,
     2: _migration_2,
+    3: _migration_3,
 }
 
 
@@ -517,6 +556,60 @@ def insert_credential_result(
     if result_id is None:
         raise DatabaseError("SQLite did not return a credential-result ID.")
     return result_id
+
+
+def insert_findings(
+    assessment_id: int,
+    findings: Iterable[Mapping[str, Any]],
+    database_path: Path = DEFAULT_DATABASE_PATH,
+) -> int:
+    """Insert new deterministic findings while leaving existing findings unchanged."""
+    rows: list[tuple[Any, ...]] = []
+    for finding in findings:
+        severity = str(finding["severity"])
+        confidence = str(finding["confidence"])
+        evidence_state = str(finding["evidence_state"])
+        if severity not in FINDING_SEVERITIES:
+            raise DatabaseError(f"Invalid finding severity: {severity}")
+        if confidence not in FINDING_CONFIDENCES:
+            raise DatabaseError(f"Invalid finding confidence: {confidence}")
+        if evidence_state not in EVIDENCE_STATES:
+            raise DatabaseError(f"Invalid finding evidence state: {evidence_state}")
+        try:
+            evidence = json.dumps(
+                finding.get("evidence", {}), sort_keys=True, separators=(",", ":")
+            )
+        except (TypeError, ValueError) as exc:
+            raise DatabaseError("Finding evidence must be JSON serializable.") from exc
+        rows.append((
+            assessment_id,
+            finding["host_id"],
+            finding.get("service_id"),
+            finding["rule_id"],
+            finding["dedupe_key"],
+            finding["title"],
+            severity,
+            confidence,
+            evidence_state,
+            finding["description"],
+            evidence,
+            finding["impact"],
+            finding["remediation"],
+        ))
+    if not rows:
+        return 0
+    try:
+        with _connection(Path(database_path)) as connection:
+            before = connection.total_changes
+            connection.executemany("""INSERT OR IGNORE INTO findings
+                (assessment_id,host_id,service_id,rule_id,dedupe_key,title,severity,
+                 confidence,evidence_state,description,evidence,impact,remediation)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""", rows)
+            inserted = connection.total_changes - before
+            connection.commit()
+    except sqlite3.Error as exc:
+        raise DatabaseError(f"Unable to store findings: {exc}") from exc
+    return inserted
 
 
 def register_artifact(

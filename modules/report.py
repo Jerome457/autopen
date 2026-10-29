@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import json
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -67,6 +68,35 @@ def _credential_table(credentials: list[sqlite3.Row]) -> str:
         "<th>Service</th><th>Port</th><th>Username</th><th>Result</th>"
         f"</tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
     )
+
+
+def _findings_output(findings: list[sqlite3.Row]) -> str:
+    """Render escaped finding details without interpreting stored evidence."""
+    if not findings:
+        return (
+            '<p class="empty">No findings were generated for this host. This does not '
+            "establish that the system is secure.</p>"
+        )
+    cards: list[str] = []
+    for finding in findings:
+        try:
+            evidence = json.dumps(json.loads(finding["evidence"]), indent=2, sort_keys=True)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            evidence = str(finding["evidence"])
+        cards.append(
+            '<article class="finding">'
+            f"<h3>{_escape(finding['title'])}</h3>"
+            f'<p><span class="badge severity-{_escape(finding["severity"])}">'
+            f"{_escape(finding['severity'])}</span> "
+            f"<strong>Confidence:</strong> {_escape(finding['confidence'])} · "
+            f"<strong>Evidence state:</strong> {_escape(finding['evidence_state'])}</p>"
+            f"<p>{_escape(finding['description'])}</p>"
+            f"<h4>Supporting evidence</h4><pre>{_escape(evidence)}</pre>"
+            f"<h4>Impact</h4><p>{_escape(finding['impact'])}</p>"
+            f"<h4>Remediation</h4><p>{_escape(finding['remediation'])}</p>"
+            "</article>"
+        )
+    return "".join(cards)
 
 
 def generate_report(
@@ -153,6 +183,12 @@ def generate_report(
                 """,
                 (assessment_id,),
             ).fetchall()
+            findings = connection.execute(
+                """SELECT id,host_id,service_id,rule_id,title,severity,confidence,
+                          evidence_state,description,evidence,impact,remediation
+                   FROM findings WHERE assessment_id=? ORDER BY host_id,id""",
+                (assessment_id,),
+            ).fetchall()
     except ReportError:
         raise
     except sqlite3.Error as exc:
@@ -220,6 +256,9 @@ def generate_report(
             host_credentials = [
                 row for row in credentials if row["host_id"] == host["id"]
             ]
+            host_findings = [
+                row for row in findings if row["host_id"] == host["id"]
+            ]
             open_count = sum(
                 str(row["state"]).lower() == "open" for row in host_services
             )
@@ -247,6 +286,7 @@ def generate_report(
                 f"<p><strong>Execution status:</strong> {_escape(host['status'])}</p>"
                 f"<h3>Services</h3>{service_table}"
                 f"<h3>Credential Testing</h3>{_credential_table(host_credentials)}"
+                f"<h3>Security Findings</h3>{_findings_output(host_findings)}"
                 "</section>"
             )
     else:
@@ -260,6 +300,7 @@ def generate_report(
             f"<h2>Host: {_escape(assessment['target'])}</h2>"
             f"<h3>Services</h3>{_table_or_empty(('Port', 'Protocol', 'State', 'Service', 'Version'), service_rows, 'No services were recorded for this host.')}"
             f"<h3>Credential Testing</h3>{_credential_table(credentials)}"
+            f"<h3>Security Findings</h3>{_findings_output(findings)}"
             "</section>"
         )
     host_summary_table = _table_or_empty(
@@ -290,6 +331,10 @@ def generate_report(
     host_status_label = ", ".join(
         dict.fromkeys(str(row[1]) for row in host_summary_rows)
     )
+    severity_counts = {
+        severity: sum(row["severity"] == severity for row in findings)
+        for severity in ("high", "medium", "low", "informational")
+    }
 
     document = f"""<!doctype html>
 <html lang="en">
@@ -328,6 +373,13 @@ def generate_report(
     .badge.neutral {{ color:var(--neutral); background:var(--neutral-bg); }}
     .empty {{ margin:0; padding:14px; color:var(--muted); background:#f8fafc; border-radius:9px; }}
     .summary {{ margin:0; padding-left:21px; }} .summary li+li {{ margin-top:8px; }}
+    .finding {{ margin-top:14px; padding:16px; border:1px solid var(--line); border-radius:10px; }}
+    .finding h3,.finding h4 {{ margin:0 0 9px; }}
+    .finding pre {{ padding:12px; overflow:auto; background:#f7f9fc; border-radius:8px; white-space:pre-wrap; }}
+    .severity-high {{ color:#b42318; background:#fef3f2; }}
+    .severity-medium {{ color:#b54708; background:#fffaeb; }}
+    .severity-low {{ color:#175cd3; background:#eff8ff; }}
+    .severity-informational {{ color:var(--neutral); background:var(--neutral-bg); }}
     .artifacts code {{ color:#273b64; overflow-wrap:anywhere; }}
     footer {{ padding:25px 0 8px; text-align:center; color:var(--muted); font-size:13px; }}
     @media (max-width:760px) {{ .meta,.stats {{ grid-template-columns:1fr 1fr; }} .hero {{ padding:24px; }} }}
@@ -359,6 +411,17 @@ def generate_report(
     <div class="stat"><span class="label">Source IPs</span><span class="value">{address_counts[0]:,}</span></div>
     <div class="stat"><span class="label">Destination IPs</span><span class="value">{address_counts[1]:,}</span></div>
   </div>
+
+  <section><h2>Finding Summary</h2>
+    <p>Severities are project-defined review priorities, not CVSS scores. Informational observations are separated from potential security issues.</p>
+    <div class="stats">
+      <div class="stat"><span class="label">High</span><span class="value">{severity_counts['high']}</span></div>
+      <div class="stat"><span class="label">Medium</span><span class="value">{severity_counts['medium']}</span></div>
+      <div class="stat"><span class="label">Low</span><span class="value">{severity_counts['low']}</span></div>
+      <div class="stat"><span class="label">Informational observations</span><span class="value">{severity_counts['informational']}</span></div>
+    </div>
+    <p>No findings does not establish that a system is secure.</p>
+  </section>
 
   <section><h2>Host Summary</h2>{host_summary_table}</section>
   {host_sections_html}

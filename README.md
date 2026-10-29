@@ -119,7 +119,7 @@ python -m unittest discover -s tests -v
 The current mocked unit-test suite has:
 
 ```text
-Ran 47 tests
+Ran 55 tests
 
 OK
 ```
@@ -470,6 +470,43 @@ Capture can overlap reconnaissance and credential phases. Packets intentionally 
 their original assessment ID, addresses, and timestamps rather than receiving a
 guessed host or phase assignment.
 
+## Evidence-Based Security Findings
+
+After host observations are stored, AutoPen runs deterministic offline analysis from
+SQLite. Analysis does not launch scanners or credential tools and can be rerun without
+duplicating or rewriting existing findings. Findings are scoped to their assessment,
+host, and optional service through foreign keys. Evidence is stored as structured JSON.
+
+The project rules are:
+
+- `AUTOPEN.SSH.CREDENTIAL_ACCEPTED` — **high**, high confidence, confirmed
+  observation. Requires an explicit `matched` SSH credential result. High is a
+  project-defined lab prioritization because supplied credentials permitted account
+  access; account privileges remain unknown. It does not claim that a password was
+  default, common, reused, or discovered without prior knowledge.
+- `AUTOPEN.REMOTE_ACCESS.CLEARTEXT_POTENTIAL` — **medium**, medium confidence,
+  potential issue. Requires positive FTP or Telnet service identification, not a port
+  number. FTP evidence explicitly notes that TLS availability or enforcement was not
+  tested. Identified FTPS/TLS services are excluded.
+- `AUTOPEN.HTTP.TRANSPORT_REVIEW` — **low**, medium confidence, potential issue.
+  Requires positive plain-HTTP identification. HTTPS/TLS services are excluded.
+  Redirects, authentication, sensitive content, and TLS enforcement are not tested.
+- `AUTOPEN.SERVICE.EXPOSURE_OBSERVED` — **informational**, high confidence,
+  confirmed observation. Records other open services not already represented by a
+  more specific rule. Reachability is not proof of a vulnerability and means only that
+  the service was reached from the assessment machine, not from the Internet.
+
+These severities are project-defined review priorities, not CVSS scores. Service
+versions do not generate CVE claims. A `no_match` result means only that the supplied
+candidates did not authenticate; `skipped`, `failed`, and `timed_out` describe test
+coverage and do not produce credential-success findings. An empty scan or an absence
+of findings does not establish that a host is reachable or secure. Execution status
+and finding severity are independent, and AutoPen-generated traffic is not treated as
+an independently detected attack.
+
+Plaintext candidate and matched passwords are never included in finding evidence or
+the HTML report.
+
 ---
 
 # Running Without Hydra
@@ -546,6 +583,7 @@ IS_project/
 │   ├── credential_test.py
 │   ├── pcap_parser.py
 │   ├── database.py
+│   ├── security_analysis.py
 │   └── report.py
 │
 ├── tests/
@@ -554,6 +592,7 @@ IS_project/
 │   ├── test_credential_test.py
 │   ├── test_pcap_parser.py
 │   ├── test_database.py
+│   ├── test_security_analysis.py
 │   ├── test_report.py
 │   └── test_autopen.py
 │
