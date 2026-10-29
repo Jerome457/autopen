@@ -119,7 +119,7 @@ python -m unittest discover -s tests -v
 The current mocked unit-test suite has:
 
 ```text
-Ran 55 tests
+Ran 61 tests
 
 OK
 ```
@@ -389,6 +389,35 @@ Open the report path printed by AutoPen, for example:
 firefox reports/assessments/7/report.html
 ```
 
+The standalone report works offline and contains:
+
+- An assessment overview with execution, target, finding, and coverage status.
+- A host comparison table that keeps execution state separate from finding priority.
+- Per-host services, credential outcomes and reasons, findings, and traffic summaries.
+- Assessment-wide packet, byte, protocol, and connection statistics.
+- Relative links to preserved artifacts plus explicit scope and methodology limitations.
+
+Host traffic is correlated at report time using normalized stored IPv4/IPv6 source and
+destination addresses. Packets between two assessed hosts appear in both host summaries,
+so host packet and byte totals can overlap and must not be added to calculate the
+assessment total. Missing and non-IP addresses are ignored for host matching.
+
+Service-supporting traffic requires the target address, transport protocol, and service
+port on the target side of the packet. This prevents a client ephemeral port that happens
+to equal a service port from creating an unrelated match. SSH credential findings use a
+valid credential-test phase time window when available; otherwise they are explicitly
+labeled as assessment-wide service traffic.
+
+SSH packet contents are encrypted. Packet metadata can corroborate that SSH traffic was
+observed, but it cannot establish whether authentication succeeded. Only the controlled
+credential tool's stored `matched` outcome supports that conclusion. Zero matching
+packets does not invalidate a stored tool result or prove that no traffic occurred.
+
+Coverage status is reported separately from findings. Missing phases remain unknown for
+legacy assessments, failed analysis is not presented as a clean result, and hosts with no
+findings are never labeled secure or low risk. Project severities remain qualitative
+priorities rather than CVSS scores.
+
 ### PCAP
 
 ```bash
@@ -593,6 +622,7 @@ IS_project/
 │   ├── test_pcap_parser.py
 │   ├── test_database.py
 │   ├── test_security_analysis.py
+│   ├── test_report_traffic.py
 │   ├── test_report.py
 │   └── test_autopen.py
 │

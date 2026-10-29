@@ -279,6 +279,24 @@ class AutoPenTests(unittest.TestCase):
         )
         mocks["generate_report"].assert_called_once()
 
+    def test_final_status_is_persisted_before_report_rendering(self) -> None:
+        events: list[str] = []
+        mocks = common_mocks()
+        mocks["run_recon"] = Mock(return_value=[IPP_SERVICE])
+        mocks["finish_assessment"] = Mock(
+            side_effect=lambda *_args, **_kwargs: events.append("assessment-finished")
+        )
+        mocks["generate_report"] = Mock(
+            side_effect=lambda *_args, **_kwargs: events.append("report-rendered")
+            or Path("reports/assessments/1/report.html")
+        )
+
+        with patch("builtins.print"), patch.multiple(autopen, **mocks):
+            status = autopen.main(["--target", "127.0.0.1", "--interface", "lo"])
+
+        self.assertEqual(status, 0)
+        self.assertLess(events.index("assessment-finished"), events.index("report-rendered"))
+
 
 if __name__ == "__main__":
     unittest.main()
