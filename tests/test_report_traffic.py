@@ -19,7 +19,7 @@ from modules.database import (
     start_phase,
     update_artifact_status,
 )
-from modules.report import _host_traffic, generate_report
+from modules.report import _host_traffic, _timestamp, generate_report
 from modules.security_analysis import analyze_assessment
 
 
@@ -115,6 +115,9 @@ class ReportTrafficTests(unittest.TestCase):
 
         self.assertIn("Assessment-wide service traffic: 1 packets / 60 bytes.", document)
         self.assertIn("timestamps were unavailable or unsuitable", document)
+
+    def test_naive_packet_timestamp_is_unsuitable_for_phase_correlation(self) -> None:
+        self.assertIsNone(_timestamp("2026-10-29T23:58:31.250000"))
 
     def test_incomplete_analysis_is_distinct_from_completed_no_findings(self) -> None:
         failed_id = create_assessment("192.168.56.20", database_path=self.database)

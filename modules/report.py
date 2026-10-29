@@ -63,7 +63,7 @@ def _timestamp(value: Any) -> datetime | None:
         except (ValueError, OverflowError, OSError):
             return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        return None
     return parsed.astimezone(timezone.utc)
 
 

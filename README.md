@@ -1,4 +1,4 @@
-# AutoPen — Collaborator Setup
+# AutoPen — Setup and Demonstration Guide
 
 This guide is for collaborators who have cloned the AutoPen repository onto a new **Ubuntu 22.04** machine and want to get the development environment running.
 
@@ -119,7 +119,7 @@ python -m unittest discover -s tests -v
 The current mocked unit-test suite has:
 
 ```text
-Ran 61 tests
+Ran 63 tests
 
 OK
 ```
@@ -311,6 +311,9 @@ Typical output:
 [*] Storing forensic data...
 [+] Assessment stored in data/autopen.db
 
+[*] Analyzing stored security evidence...
+[+] <N> new findings stored
+
 [*] Generating consolidated report...
 [+] Report saved: reports/assessments/<assessment-id>/report.html
 
@@ -319,41 +322,66 @@ Typical output:
 
 Packet counts and discovered services will differ between machines.
 
-## 11. Sequential Multi-Host Lab Test
+## 11. Sequential Multi-Host Docker Lab Test
 
 Supply each authorized lab address with a separate `--target`. AutoPen validates,
 normalizes, and deduplicates every address before creating an assessment or starting
-external tools:
+external tools.
+
+The repository includes a reproducible three-target Docker lab. These targets are
+separate containers sharing the host Linux kernel; they are not three virtual machines:
+
+- Target A (`172.28.50.10`): SSH on TCP 22 with disposable account `autopen-test`.
+- Target B (`172.28.50.20`): plain HTTP on TCP 8080.
+- Target C (`172.28.50.30`): FTP on TCP 21.
+
+All targets attach only to the internal `autopen-lab` bridge. No target ports are
+published to host interfaces. See [`lab/README.md`](lab/README.md) for the complete
+build, startup, password-rotation, and cleanup procedure.
+
+Initialize the ignored lab secrets and start the targets:
 
 ```bash
-python3 autopen.py \
-    --target 192.168.56.20 \
-    --target 192.168.56.21 \
-    --interface <lab-interface> \
+./lab/init-secrets.sh
+docker compose -f lab/compose.yaml build
+docker compose -f lab/compose.yaml up -d
+```
+
+Before every assessment, use Docker inspection to confirm that the expected containers
+still own the documented addresses and that `aplab0` exists. Do not infer authorization
+from a route or discover additional targets by scanning.
+
+Run the authorized three-target assessment with:
+
+```bash
+.venv/bin/python autopen.py \
+    --target 172.28.50.10 \
+    --target 172.28.50.20 \
+    --target 172.28.50.30 \
+    --interface aplab0 \
     --ssh-user autopen-test \
-    --password-list data/credentials.txt
+    --password-list data/lab_credentials.txt
 ```
 
 Targets are processed sequentially within one assessment. A single TShark capture,
 restricted to the supplied addresses with a BPF filter, spans the host loop. The
 capture is then parsed once and its traffic statistics are assessment-wide.
 
-This milestone supports one isolated lab network and one explicit capture interface
-per assessment. It does not support target files, subnet expansion, concurrent scans,
-or per-host interfaces. Loopback-only runs automatically select `lo`; loopback and
-non-loopback targets cannot be combined.
+The current implementation supports one isolated lab network and one explicit capture
+interface per assessment. It does not support target files, subnet expansion,
+concurrent scans, or per-host interfaces. Loopback-only runs automatically select `lo`;
+loopback and non-loopback targets cannot be combined.
 
-To identify the interface connected to the authorized lab network, inspect:
+To verify the capture interface connected to this authorized lab, inspect:
 
 ```bash
 tshark -D
 ip address
-ip route get 192.168.56.20
+docker network inspect autopen-lab
 ```
 
-Use the interface shown for the route to the lab target, such as a VirtualBox host-only
-interface. Do not guess an interface name or select an interface connected to an
-unauthorized network.
+Use only the verified interface for the isolated lab. Do not guess an interface name or
+select an interface connected to an unauthorized network.
 
 When `--ssh-user` and `--password-list` are supplied, that same explicit lab
 configuration applies to every listed target where SSH is discovered. Both arguments
@@ -361,8 +389,25 @@ are required together. Candidate and matched passwords are never printed or stor
 
 Execution status describes whether collection stages ran successfully; it is not a
 security verdict. A `completed` host may have no open services, and an open service or
-matched lab credential does not by itself change execution completion. Structured
-security findings and risk analysis belong to a later milestone.
+matched lab credential does not by itself change execution completion. After collection,
+AutoPen generates deterministic evidence-based findings from stored observations. The
+rules and their limitations are documented below.
+
+### Password-remediation demonstration
+
+The lab supports a controlled before/after demonstration. First run the assessment with
+the generated candidate list. Then rotate only Target A's ignored runtime secret using
+the procedure in [`lab/README.md`](lab/README.md), leaving
+`data/lab_credentials.txt` unchanged, and run the same command again.
+
+A valid comparison should retain the same discovered services while changing Target A's
+credential outcome from `matched` to `no_match`. The accepted-credential High finding
+should disappear; an informational SSH exposure observation may remain. Target B's HTTP
+review and Target C's potential cleartext FTP finding are unrelated to the SSH password
+rotation and should remain when the underlying evidence is unchanged.
+
+`no_match` means only that none of the supplied candidates authenticated during that
+completed test. It does not prove overall account security or resistance to all guessing.
 
 ---
 
@@ -386,7 +431,8 @@ provenance cannot be established.
 Open the report path printed by AutoPen, for example:
 
 ```bash
-firefox reports/assessments/7/report.html
+ASSESSMENT_ID=YOUR_ASSESSMENT_ID
+firefox "reports/assessments/$ASSESSMENT_ID/report.html"
 ```
 
 The standalone report works offline and contains:
@@ -421,13 +467,15 @@ priorities rather than CVSS scores.
 ### PCAP
 
 ```bash
-wireshark data/assessments/7/capture.pcap
+ASSESSMENT_ID=YOUR_ASSESSMENT_ID
+wireshark "data/assessments/$ASSESSMENT_ID/capture.pcap"
 ```
 
 or:
 
 ```bash
-tshark -r data/assessments/7/capture.pcap | head
+ASSESSMENT_ID=YOUR_ASSESSMENT_ID
+tshark -r "data/assessments/$ASSESSMENT_ID/capture.pcap" | head
 ```
 
 ### SQLite
@@ -612,10 +660,12 @@ IS_project/
 │   ├── credential_test.py
 │   ├── pcap_parser.py
 │   ├── database.py
+│   ├── artifacts.py
 │   ├── security_analysis.py
 │   └── report.py
 │
 ├── tests/
+│   ├── test_artifacts.py
 │   ├── test_recon.py
 │   ├── test_capture.py
 │   ├── test_credential_test.py
@@ -626,8 +676,17 @@ IS_project/
 │   ├── test_report.py
 │   └── test_autopen.py
 │
+├── lab/
+│   ├── compose.yaml
+│   ├── init-secrets.sh
+│   ├── README.md
+│   ├── target-a/            # SSH target
+│   ├── target-b/            # HTTP target
+│   └── target-c/            # FTP target
+│
 ├── data/
 │   ├── credentials.txt      # local test data — don't commit
+│   ├── lab_credentials.txt  # generated lab data — don't commit
 │   ├── assessments/         # preserved per-assessment PCAPs
 │   └── autopen.db           # generated
 │
@@ -644,10 +703,12 @@ Do **not** commit:
 ```text
 .venv/
 data/credentials.txt
+data/lab_credentials.txt
 data/capture.pcap
 data/assessments/
 data/autopen.db
 data/*.backup
+lab/secrets/
 reports/report.html
 reports/assessments/
 __pycache__/

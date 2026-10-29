@@ -60,6 +60,19 @@ class PcapParserTests(unittest.TestCase):
         self.assertIsNone(record["src_port"])
         self.assertIsNone(record["dst_port"])
 
+    def test_packet_timestamp_prefers_epoch_and_normalizes_to_utc(self) -> None:
+        packet = SimpleNamespace(
+            sniff_time=datetime(2026, 10, 29, 23, 58, 31),
+            sniff_timestamp="1793298511.25",
+            ip=SimpleNamespace(src="192.0.2.1", dst="192.0.2.2"),
+            tcp=SimpleNamespace(srcport="40000", dstport="22"),
+            length="74",
+        )
+
+        record = packet_to_record(packet)
+
+        self.assertEqual(record["timestamp"], "2026-10-29T18:28:31.250000+00:00")
+
     def test_parse_pcap_returns_records_and_closes_capture(self) -> None:
         packet = SimpleNamespace(highest_layer="DATA", length="10")
         fake_capture = FakeCapture([packet])

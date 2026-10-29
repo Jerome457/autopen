@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TypedDict
 
@@ -82,13 +82,19 @@ def packet_to_record(packet: Any) -> PacketInfo:
         protocol = _text(_attribute(packet, "highest_layer")) or "UNKNOWN"
         protocol = protocol.upper()
 
-    sniff_time = _attribute(packet, "sniff_time")
-    if isinstance(sniff_time, datetime):
-        timestamp = sniff_time.isoformat()
-    elif sniff_time is not None:
-        timestamp = str(sniff_time)
-    else:
-        timestamp = _text(_attribute(packet, "sniff_timestamp"))
+    sniff_timestamp = _attribute(packet, "sniff_timestamp")
+    try:
+        timestamp = datetime.fromtimestamp(
+            float(sniff_timestamp), timezone.utc
+        ).isoformat()
+    except (TypeError, ValueError, OverflowError, OSError):
+        sniff_time = _attribute(packet, "sniff_time")
+        if isinstance(sniff_time, datetime) and sniff_time.tzinfo is not None:
+            timestamp = sniff_time.astimezone(timezone.utc).isoformat()
+        elif sniff_time is not None:
+            timestamp = str(sniff_time)
+        else:
+            timestamp = None
 
     return {
         "timestamp": timestamp,
